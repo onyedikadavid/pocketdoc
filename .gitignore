@@ -1,0 +1,13 @@
+# mkdir -p ~/.kaggle && echo KGAT_007d795fadccb0362c5ccc7e766db522 > ~/.kaggle/access_token && chmod 600 ~/.kaggle/access_token
+
+# kaggle api =KGAT_007d795fadccb0362c5ccc7e766db522
+# using the api =kaggle competitions list
+__pycache__/
+*.pyc
+.env
+venv/
+env/
+Data/
+UI designs/
+outputs/
+Notebooks/
