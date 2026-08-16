@@ -44,11 +44,21 @@ print("Model loaded successfully!")
 
 
 def find_target_conv_layer(model: tf.keras.Model) -> str:
-    """Finds the last 4D convolutional feature map layer in the model for Grad-CAM."""
+    """Finds the last 2D/4D convolutional layer safely without crashing on non-spatial layers."""
+    # First check layer instance types (standard for Keras/TensorFlow models)
     for layer in reversed(model.layers):
-        if len(layer.output_shape) == 4:
+        if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)):
             return layer.name
-    raise ValueError("No 4D convolutional layer found in model architecture.")
+
+    # Fallback: check output tensor shape rank safely
+    for layer in reversed(model.layers):
+        try:
+            if hasattr(layer, "output") and len(layer.output.shape) == 4:
+                return layer.name
+        except Exception:
+            continue
+
+    raise ValueError("No 2D/4D convolutional layer found in model architecture for Grad-CAM.")
 
 
 TARGET_CONV_LAYER = find_target_conv_layer(model)
