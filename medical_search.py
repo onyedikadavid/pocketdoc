@@ -65,7 +65,7 @@ def fetch_dynamic_disease_info(condition_name: str) -> dict:
 
         # Enforce Pydantic JSON schema response using google-genai
         response = gemini_client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash",
             contents=f"Provide structured insights for {condition_name}.",
             config=types.GenerateContentConfig(
                 system_instruction=system_prompt,
