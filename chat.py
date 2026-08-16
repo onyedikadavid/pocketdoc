@@ -1,16 +1,19 @@
-# chat.py
 import os
 import json
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional
-from openai import OpenAI
+
+from google import genai
+from google.genai import types
 
 from medical_search import fetch_dynamic_disease_info
 
 router = APIRouter()
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# Initialize Gemini Client (reads GEMINI_API_KEY from environment)
+gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 
 class ChatMessage(BaseModel):
@@ -23,63 +26,61 @@ class ChatRequest(BaseModel):
     scan_context: Optional[dict] = None
 
 
-# Define Tools for General Intake, Medical Knowledge Lookup, and Doctor Handoff
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "lookup_medical_knowledge",
-            "description": "Fetch clinical information for skin diseases, general conditions (e.g., Malaria, Typhoid, Gastroenteritis), or symptoms.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "condition_name": {
-                        "type": "string",
-                        "description": "The medical term or disease name to research."
-                    }
-                },
-                "required": ["condition_name"]
-            }
-        }
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "generate_doctor_intake_summary",
-            "description": "Generate a structured intake note containing chief complaint, duration, severity, and suspected condition to transfer to a consulting physician.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "chief_complaint": {"type": "string", "description": "Primary issue reported by patient (e.g. High fever, chills, rash)."},
-                    "symptom_duration": {"type": "string", "description": "How long the patient has felt sick."},
-                    "severity_scale": {"type": "string", "enum": ["LOW", "MODERATE", "HIGH", "EMERGENCY"]},
-                    "suspected_category": {"type": "string", "description": "General medicine, Dermatology, Pediatrics, etc."},
-                    "summary_notes": {"type": "string", "description": "Brief clinical summary for the doctor review."}
-                },
-                "required": ["chief_complaint", "symptom_duration", "severity_scale", "suspected_category", "summary_notes"]
-            }
-        }
-    }
-]
+# Define Tool Declarations using google-genai Types
+lookup_medical_tool = types.FunctionDeclaration(
+    name="lookup_medical_knowledge",
+    description="Fetch clinical information for skin diseases, general conditions (e.g., Malaria, Typhoid, Gastroenteritis), or symptoms.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "condition_name": types.Schema(
+                type=types.Type.STRING,
+                description="The medical term or disease name to research."
+            )
+        },
+        required=["condition_name"]
+    )
+)
+
+intake_summary_tool = types.FunctionDeclaration(
+    name="generate_doctor_intake_summary",
+    description="Generate a structured intake note containing chief complaint, duration, severity, and suspected condition to transfer to a consulting physician.",
+    parameters=types.Schema(
+        type=types.Type.OBJECT,
+        properties={
+            "chief_complaint": types.Schema(type=types.Type.STRING, description="Primary issue reported by patient (e.g. High fever, chills, rash)."),
+            "symptom_duration": types.Schema(type=types.Type.STRING, description="How long the patient has felt sick."),
+            "severity_scale": types.Schema(
+                type=types.Type.STRING, 
+                enum=["LOW", "MODERATE", "HIGH", "EMERGENCY"],
+                description="Patient severity level"
+            ),
+            "suspected_category": types.Schema(type=types.Type.STRING, description="General medicine, Dermatology, Pediatrics, etc."),
+            "summary_notes": types.Schema(type=types.Type.STRING, description="Brief clinical summary for the doctor review.")
+        },
+        required=["chief_complaint", "symptom_duration", "severity_scale", "suspected_category", "summary_notes"]
+    )
+)
+
+AGENT_TOOLS = [types.Tool(function_declarations=[lookup_medical_tool, intake_summary_tool])]
 
 
-def execute_tool(name: str, arguments: dict) -> str:
+def execute_tool(name: str, arguments: dict) -> dict:
     try:
         if name == "lookup_medical_knowledge":
             condition = arguments.get("condition_name", "")
-            return json.dumps(fetch_dynamic_disease_info(condition))
+            return fetch_dynamic_disease_info(condition)
 
         elif name == "generate_doctor_intake_summary":
-            # Formats a summary payload ready for doctor handoff or database persistence
-            return json.dumps({
+            return {
                 "status": "SUMMARY_GENERATED",
                 "summary": arguments,
                 "action": "Ready to transfer to a doctor or present 'Connect to Doctor' booking option."
-            })
+            }
 
-        return json.dumps({"error": f"Unknown tool: {name}"})
+        return {"error": f"Unknown tool: {name}"}
     except Exception as e:
-        return json.dumps({"error": "Tool execution failed", "details": str(e)})
+        return {"error": "Tool execution failed", "details": str(e)}
 
 
 AGENT_SYSTEM_PROMPT = """
@@ -124,71 +125,86 @@ async def stream_agentic_chat(payload: ChatRequest):
 
         system_instruction = AGENT_SYSTEM_PROMPT.format(scan_info=scan_info)
 
-        formatted_messages = [{"role": "system", "content": system_instruction}]
+        # Convert input message history into Gemini Content format
+        contents = []
         for msg in payload.messages:
-            formatted_messages.append({"role": msg.role, "content": msg.content or ""})
+            role = "user" if msg.role in ["user", "system"] else "model"
+            contents.append(
+                types.Content(
+                    role=role,
+                    parts=[types.Part.from_text(text=msg.content or "")]
+                )
+            )
 
+        captured_intake_summary = None
         MAX_TOOL_ITERATIONS = 3
         iterations = 0
 
-        # Captures the structured intake payload if the agent decides to
-        # generate one during this turn, so it can be pushed to the frontend
-        # as a distinct SSE event (separate from plain text token frames).
-        captured_intake_summary = None
-
+        # Handle tool calls in non-streaming loop first
         while iterations < MAX_TOOL_ITERATIONS:
-            response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=formatted_messages,
-                tools=TOOLS,
-                tool_choice="auto",
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                tools=AGENT_TOOLS,
                 temperature=0.3
             )
 
-            response_message = response.choices[0].message
-            tool_calls = response_message.tool_calls
+            response = gemini_client.models.generate_content(
+                model="gemini-1.5-flash",
+                contents=contents,
+                config=config
+            )
 
-            if not tool_calls:
+            # Check if Gemini triggered tool calls
+            function_calls = response.function_calls
+            if not function_calls:
+                # No more tools requested, ready to stream final response
                 break
 
-            formatted_messages.append(response_message)
-
-            for tool_call in tool_calls:
-                fn_name = tool_call.function.name
-                fn_args = json.loads(tool_call.function.arguments or "{}")
+            # Process function calls
+            for call in function_calls:
+                fn_name = call.name
+                fn_args = call.args or {}
                 tool_result = execute_tool(fn_name, fn_args)
 
                 if fn_name == "generate_doctor_intake_summary":
                     captured_intake_summary = fn_args
 
-                formatted_messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": fn_name,
-                    "content": tool_result
-                })
+                # Append model choice and function response to history
+                contents.append(response.candidates[0].content)
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part.from_function_response(
+                                name=fn_name,
+                                response={"result": tool_result}
+                            )
+                        ]
+                    )
+                )
 
             iterations += 1
 
         async def generate_stream():
-            # Send the structured intake summary FIRST (if one was generated
-            # this turn) so the frontend can render a "ready to transfer"
-            # card before the assistant's closing message even finishes
-            # streaming.
+            # If an intake summary was created, send it to the frontend first
             if captured_intake_summary is not None:
                 yield f"data: {json.dumps({'type': 'intake_summary', 'summary': captured_intake_summary})}\n\n"
 
-            stream_response = openai_client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=formatted_messages,
-                stream=True,
+            # Stream final assistant text response back to the client
+            stream_config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
                 temperature=0.4
             )
 
-            for chunk in stream_response:
-                content = chunk.choices[0].delta.content
-                if content:
-                    yield f"data: {json.dumps({'type': 'token', 'content': content})}\n\n"
+            response_stream = gemini_client.models.generate_content_stream(
+                model="gemini-1.5-flash",
+                contents=contents,
+                config=stream_config
+            )
+
+            for chunk in response_stream:
+                if chunk.text:
+                    yield f"data: {json.dumps({'type': 'token', 'content': chunk.text})}\n\n"
 
             yield "data: [DONE]\n\n"
 
