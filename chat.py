@@ -149,7 +149,7 @@ async def stream_agentic_chat(payload: ChatRequest):
             )
 
             response = gemini_client.models.generate_content(
-                model="gemini-2.0-flash",
+                model="gemini-3.7-flash",
                 contents=contents,
                 config=config
             )
@@ -197,7 +197,7 @@ async def stream_agentic_chat(payload: ChatRequest):
             )
 
             response_stream = gemini_client.models.generate_content_stream(
-                model="gemini-2.0-flash",
+                model="gemini-3.7-flash",
                 contents=contents,
                 config=stream_config
             )
