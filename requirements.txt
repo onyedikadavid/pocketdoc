@@ -1,6 +1,10 @@
 fastapi
 uvicorn
 tensorflow
-numpy
 pillow
+numpy
+opencv-python-headless
 python-multipart
+openai
+requests
+httpx

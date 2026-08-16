@@ -1,5 +1,12 @@
 # api_server.py
+import os
+# Force TensorFlow to run on CPU to avoid CUDA initialization errors on CPU platforms like Render
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import base64
 import io
+import cv2
 import numpy as np
 import tensorflow as tf
 from PIL import Image
@@ -8,6 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 from class_mappings import CLASS_NAMES, CLEAN_LABELS, determine_triage_level
+from medical_search import fetch_dynamic_disease_info  # Dynamic insights import
+from chat import router as chat_router  # Imported pre-consultation chat router
+from intake import router as intake_router  # Doctor handoff / intake transfer router
 
 app = FastAPI(title="PocketDoc AI Microservice", version="1.0")
 
@@ -20,6 +30,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Mount the pre-consultation chatbot routes
+app.include_router(chat_router, prefix="/chat", tags=["Pre-Consultation Chat"])
+
+# Mount the doctor intake-transfer route
+app.include_router(intake_router, prefix="/intake", tags=["Doctor Handoff"])
+
 # Load Trained Model
 MODEL_PATH = Path("models/skin_disease_model.keras")
 print(f"Loading Keras Model from {MODEL_PATH}...")
@@ -27,19 +43,70 @@ model = tf.keras.models.load_model(MODEL_PATH)
 print("Model loaded successfully!")
 
 
+def find_target_conv_layer(model: tf.keras.Model) -> str:
+    """Finds the last 4D convolutional feature map layer in the model for Grad-CAM."""
+    for layer in reversed(model.layers):
+        if len(layer.output_shape) == 4:
+            return layer.name
+    raise ValueError("No 4D convolutional layer found in model architecture.")
+
+
+TARGET_CONV_LAYER = find_target_conv_layer(model)
+
+
+def generate_gradcam_heatmap(img_array: np.ndarray, target_class_idx: int) -> str:
+    """
+    Generates a Grad-CAM heatmap for the target class prediction and returns
+    a Base64 encoded JPEG string overlaid onto the original image.
+    """
+    try:
+        grad_model = tf.keras.models.Model(
+            inputs=[model.inputs],
+            outputs=[model.get_layer(TARGET_CONV_LAYER).output, model.output]
+        )
+
+        with tf.GradientTape() as tape:
+            conv_outputs, predictions = grad_model(img_array)
+            loss = predictions[:, target_class_idx]
+
+        grads = tape.gradient(loss, conv_outputs)
+        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
+
+        conv_outputs = conv_outputs[0]
+        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
+        heatmap = tf.squeeze(heatmap)
+
+        heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-10)
+        heatmap = heatmap.numpy()
+
+        heatmap = cv2.resize(heatmap, (224, 224))
+        heatmap_uint8 = np.uint8(255 * heatmap)
+        colored_heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
+
+        original_img = np.uint8(img_array[0] * 255)
+        original_bgr = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
+
+        overlay = cv2.addWeighted(original_bgr, 0.6, colored_heatmap, 0.4, 0)
+        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
+
+        pil_img = Image.fromarray(overlay_rgb)
+        buffer = io.BytesIO()
+        pil_img.save(buffer, format="JPEG")
+        base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
+
+        return f"data:image/jpeg;base64,{base64_str}"
+    except Exception as e:
+        print(f"Grad-CAM Heatmap generation failed: {str(e)}")
+        return ""
+
+
 def preprocess_image_bytes(image_bytes: bytes) -> np.ndarray:
     """Decodes raw image bytes to a preprocessed tensor for EfficientNetB0."""
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-        # Resize to EfficientNet input shape (224, 224)
         img = img.resize((224, 224))
-
         img_array = np.array(img, dtype=np.float32)
-        # Add batch dimension -> (1, 224, 224, 3)
         img_array = np.expand_dims(img_array, axis=0)
-
-        # Rescale if model was trained with 1./255 scaling
         img_array = img_array / 255.0
         return img_array
     except Exception as e:
@@ -70,29 +137,39 @@ async def predict_skin_disease(file: UploadFile = File(...)):
         for idx in top_3_indices:
             raw_class_name = CLASS_NAMES[idx]
             clean_label = CLEAN_LABELS.get(raw_class_name, raw_class_name)
-            confidence_score = float(predictions[idx])  # cast off numpy.float32
+            confidence_score = float(predictions[idx])
 
             top_3_predictions.append({
                 "class_name": clean_label,
                 "confidence": round(confidence_score, 4)
             })
 
-        # Top prediction details for triage determination
-        top_raw_class = CLASS_NAMES[int(top_3_indices[0])]  # cast off numpy.int64
-        top_confidence = float(predictions[top_3_indices[0]])
+        top_class_idx = int(top_3_indices[0])
+        top_raw_class = CLASS_NAMES[top_class_idx]
+        top_confidence = float(predictions[top_class_idx])
+        top_clean_label = top_3_predictions[0]["class_name"]
 
         triage_level = determine_triage_level(top_raw_class, top_confidence)
 
-        # Return exact JSON shape expected by src/app/api/scan/route.ts
+        # Generate Grad-CAM Visual Heatmap
+        heatmap_image = generate_gradcam_heatmap(input_tensor, top_class_idx)
+
+        # Dynamically fetch medical insight details for ANY predicted disease
+        medical_insights = fetch_dynamic_disease_info(top_clean_label)
+
         return {
             "success": True,
             "top_prediction": top_3_predictions[0],
             "top_3_predictions": top_3_predictions,
             "triage_level": triage_level,
+            "explanation": {
+                "heatmap_image": heatmap_image,
+                "description": f"Visual features highlighted in red/yellow contributed most to the '{top_clean_label}' prediction.",
+                "insights": medical_insights
+            }
         }
 
     except ValueError as e:
-        # Bad/corrupt image payload
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
