@@ -1,9 +1,9 @@
-# api_server.py
 import os
 # Force TensorFlow to run on CPU to avoid CUDA initialization errors on CPU platforms like Render
 os.environ["CUDA_VISIBLE_DEVICES"] = "-1"
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 
+import gc
 import base64
 import io
 import cv2
@@ -45,12 +45,10 @@ print("Model loaded successfully!")
 
 def find_target_conv_layer(model: tf.keras.Model) -> str:
     """Finds the last 2D/4D convolutional layer safely without crashing on non-spatial layers."""
-    # First check layer instance types (standard for Keras/TensorFlow models)
     for layer in reversed(model.layers):
         if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)):
             return layer.name
 
-    # Fallback: check output tensor shape rank safely
     for layer in reversed(model.layers):
         try:
             if hasattr(layer, "output") and len(layer.output.shape) == 4:
@@ -63,6 +61,12 @@ def find_target_conv_layer(model: tf.keras.Model) -> str:
 
 TARGET_CONV_LAYER = find_target_conv_layer(model)
 
+# Pre-build Grad-CAM model globally ONCE at startup to prevent memory leaks per request
+grad_model = tf.keras.models.Model(
+    inputs=[model.inputs],
+    outputs=[model.get_layer(TARGET_CONV_LAYER).output, model.output]
+)
+
 
 def generate_gradcam_heatmap(img_array: np.ndarray, target_class_idx: int) -> str:
     """
@@ -70,13 +74,11 @@ def generate_gradcam_heatmap(img_array: np.ndarray, target_class_idx: int) -> st
     a Base64 encoded JPEG string overlaid onto the original image.
     """
     try:
-        grad_model = tf.keras.models.Model(
-            inputs=[model.inputs],
-            outputs=[model.get_layer(TARGET_CONV_LAYER).output, model.output]
-        )
+        # Convert array to tensor to reduce graph generation overhead
+        img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
 
         with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_array)
+            conv_outputs, predictions = grad_model(img_tensor)
             loss = predictions[:, target_class_idx]
 
         grads = tape.gradient(loss, conv_outputs)
@@ -101,10 +103,13 @@ def generate_gradcam_heatmap(img_array: np.ndarray, target_class_idx: int) -> st
 
         pil_img = Image.fromarray(overlay_rgb)
         buffer = io.BytesIO()
-        pil_img.save(buffer, format="JPEG")
+        pil_img.save(buffer, format="JPEG", quality=85)
         base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
 
+        # Free temporary array allocations
+        del conv_outputs, grads, pooled_grads, heatmap, colored_heatmap, overlay, overlay_rgb, pil_img, buffer
         return f"data:image/jpeg;base64,{base64_str}"
+
     except Exception as e:
         print(f"Grad-CAM Heatmap generation failed: {str(e)}")
         return ""
@@ -133,6 +138,7 @@ async def predict_skin_disease(file: UploadFile = File(...)):
     if not file:
         raise HTTPException(status_code=400, detail="No image file provided")
 
+    input_tensor = None
     try:
         image_bytes = await file.read()
         input_tensor = preprocess_image_bytes(image_bytes)
@@ -164,10 +170,10 @@ async def predict_skin_disease(file: UploadFile = File(...)):
         # Generate Grad-CAM Visual Heatmap
         heatmap_image = generate_gradcam_heatmap(input_tensor, top_class_idx)
 
-        # Dynamically fetch medical insight details for ANY predicted disease
+        # Dynamically fetch medical insight details
         medical_insights = fetch_dynamic_disease_info(top_clean_label)
 
-        return {
+        response_payload = {
             "success": True,
             "top_prediction": top_3_predictions[0],
             "top_3_predictions": top_3_predictions,
@@ -179,10 +185,17 @@ async def predict_skin_disease(file: UploadFile = File(...)):
             }
         }
 
+        return response_payload
+
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+    finally:
+        # Force garbage collection to prevent memory spikes on Render 512MB RAM
+        if input_tensor is not None:
+            del input_tensor
+        gc.collect()
 
 
 if __name__ == "__main__":
