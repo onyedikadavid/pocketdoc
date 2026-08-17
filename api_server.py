@@ -15,9 +15,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pathlib import Path
 
 from class_mappings import CLASS_NAMES, CLEAN_LABELS, determine_triage_level
-from medical_search import fetch_dynamic_disease_info  # Dynamic insights import
-from chat import router as chat_router  # Imported pre-consultation chat router
-from intake import router as intake_router  # Doctor handoff / intake transfer router
+from medical_search import fetch_dynamic_disease_info
+from chat import router as chat_router
+from intake import router as intake_router
 
 app = FastAPI(title="PocketDoc AI Microservice", version="1.0")
 
@@ -30,93 +30,25 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Mount the pre-consultation chatbot routes
+# Mount sub-routers
 app.include_router(chat_router, prefix="/chat", tags=["Pre-Consultation Chat"])
-
-# Mount the doctor intake-transfer route
 app.include_router(intake_router, prefix="/intake", tags=["Doctor Handoff"])
 
-# Load Trained Model
-MODEL_PATH = Path("models/skin_disease_model.keras")
-print(f"Loading Keras Model from {MODEL_PATH}...")
-model = tf.keras.models.load_model(MODEL_PATH)
-print("Model loaded successfully!")
+# ------------------------------------------------------------------
+# 1. LOAD ONLY THE TFLITE MODEL (No .keras model loaded into RAM)
+# ------------------------------------------------------------------
+TFLITE_MODEL_PATH = Path("models/skin_model.tflite")
+print(f"Loading TFLite Model from {TFLITE_MODEL_PATH}...")
+interpreter = tf.lite.Interpreter(model_path=str(TFLITE_MODEL_PATH))
+interpreter.allocate_tensors()
 
-
-def find_target_conv_layer(model: tf.keras.Model) -> str:
-    """Finds the last 2D/4D convolutional layer safely without crashing on non-spatial layers."""
-    for layer in reversed(model.layers):
-        if isinstance(layer, (tf.keras.layers.Conv2D, tf.keras.layers.DepthwiseConv2D)):
-            return layer.name
-
-    for layer in reversed(model.layers):
-        try:
-            if hasattr(layer, "output") and len(layer.output.shape) == 4:
-                return layer.name
-        except Exception:
-            continue
-
-    raise ValueError("No 2D/4D convolutional layer found in model architecture for Grad-CAM.")
-
-
-TARGET_CONV_LAYER = find_target_conv_layer(model)
-
-# Pre-build Grad-CAM model globally ONCE at startup to prevent memory leaks per request
-grad_model = tf.keras.models.Model(
-    inputs=[model.inputs],
-    outputs=[model.get_layer(TARGET_CONV_LAYER).output, model.output]
-)
-
-
-def generate_gradcam_heatmap(img_array: np.ndarray, target_class_idx: int) -> str:
-    """
-    Generates a Grad-CAM heatmap for the target class prediction and returns
-    a Base64 encoded JPEG string overlaid onto the original image.
-    """
-    try:
-        # Convert array to tensor to reduce graph generation overhead
-        img_tensor = tf.convert_to_tensor(img_array, dtype=tf.float32)
-
-        with tf.GradientTape() as tape:
-            conv_outputs, predictions = grad_model(img_tensor)
-            loss = predictions[:, target_class_idx]
-
-        grads = tape.gradient(loss, conv_outputs)
-        pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-
-        conv_outputs = conv_outputs[0]
-        heatmap = conv_outputs @ pooled_grads[..., tf.newaxis]
-        heatmap = tf.squeeze(heatmap)
-
-        heatmap = tf.maximum(heatmap, 0) / (tf.reduce_max(heatmap) + 1e-10)
-        heatmap = heatmap.numpy()
-
-        heatmap = cv2.resize(heatmap, (224, 224))
-        heatmap_uint8 = np.uint8(255 * heatmap)
-        colored_heatmap = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-
-        original_img = np.uint8(img_array[0] * 255)
-        original_bgr = cv2.cvtColor(original_img, cv2.COLOR_RGB2BGR)
-
-        overlay = cv2.addWeighted(original_bgr, 0.6, colored_heatmap, 0.4, 0)
-        overlay_rgb = cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB)
-
-        pil_img = Image.fromarray(overlay_rgb)
-        buffer = io.BytesIO()
-        pil_img.save(buffer, format="JPEG", quality=85)
-        base64_str = base64.b64encode(buffer.getvalue()).decode("utf-8")
-
-        # Free temporary array allocations
-        del conv_outputs, grads, pooled_grads, heatmap, colored_heatmap, overlay, overlay_rgb, pil_img, buffer
-        return f"data:image/jpeg;base64,{base64_str}"
-
-    except Exception as e:
-        print(f"Grad-CAM Heatmap generation failed: {str(e)}")
-        return ""
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
+print("TFLite Model loaded successfully! RAM baseline ~70MB.")
 
 
 def preprocess_image_bytes(image_bytes: bytes) -> np.ndarray:
-    """Decodes raw image bytes to a preprocessed tensor for EfficientNetB0."""
+    """Decodes raw image bytes to a preprocessed array for EfficientNetB0."""
     try:
         img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
         img = img.resize((224, 224))
@@ -130,7 +62,7 @@ def preprocess_image_bytes(image_bytes: bytes) -> np.ndarray:
 
 @app.get("/")
 def health_check():
-    return {"status": "online", "model": "EfficientNetB0 (23 classes)"}
+    return {"status": "online", "model": "EfficientNetB0 TFLite (23 classes)"}
 
 
 @app.post("/predict")
@@ -143,10 +75,14 @@ async def predict_skin_disease(file: UploadFile = File(...)):
         image_bytes = await file.read()
         input_tensor = preprocess_image_bytes(image_bytes)
 
-        # Run Prediction Inference
-        predictions = model.predict(input_tensor, verbose=0)[0]
+        # ------------------------------------------------------------------
+        # 2. TFLITE INFERENCE (Ultra-fast & lightweight)
+        # ------------------------------------------------------------------
+        interpreter.set_tensor(input_details[0]['index'], input_tensor)
+        interpreter.invoke()
+        predictions = interpreter.get_tensor(output_details[0]['index'])[0]
 
-        # Get Top-3 Predictions, highest confidence first
+        # Extract Top 3 Predictions
         top_3_indices = np.argsort(predictions)[-3:][::-1]
 
         top_3_predictions = []
@@ -167,10 +103,7 @@ async def predict_skin_disease(file: UploadFile = File(...)):
 
         triage_level = determine_triage_level(top_raw_class, top_confidence)
 
-        # Generate Grad-CAM Visual Heatmap
-        heatmap_image = generate_gradcam_heatmap(input_tensor, top_class_idx)
-
-        # Dynamically fetch medical insight details
+        # Fetch dynamic medical insight details
         medical_insights = fetch_dynamic_disease_info(top_clean_label)
 
         response_payload = {
@@ -179,8 +112,8 @@ async def predict_skin_disease(file: UploadFile = File(...)):
             "top_3_predictions": top_3_predictions,
             "triage_level": triage_level,
             "explanation": {
-                "heatmap_image": heatmap_image,
-                "description": f"Visual features highlighted in red/yellow contributed most to the '{top_clean_label}' prediction.",
+                "heatmap_image": "",  # Skipped to keep RAM under 100MB
+                "description": f"AI evaluation identified key features consistent with '{top_clean_label}'.",
                 "insights": medical_insights
             }
         }
@@ -192,7 +125,6 @@ async def predict_skin_disease(file: UploadFile = File(...)):
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
     finally:
-        # Force garbage collection to prevent memory spikes on Render 512MB RAM
         if input_tensor is not None:
             del input_tensor
         gc.collect()
