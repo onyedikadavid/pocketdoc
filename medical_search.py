@@ -6,8 +6,18 @@ from google.genai import types
 from pydantic import BaseModel
 from typing import List
 
-# Initialize Gemini Client (reads GEMINI_API_KEY from environment)
-gemini_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# Initialize Gemini Client with automatic HTTP retries for 503/429 status codes
+gemini_client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    http_options=types.HttpOptions(
+        retry_options=types.HttpRetryOptions(
+            attempts=3,
+            initial_delay=1.0,
+            max_delay=5.0,
+            http_status_codes=[408, 429, 500, 502, 503, 504]
+        )
+    )
+)
 
 
 class MedicalInsightSchema(BaseModel):
@@ -22,7 +32,9 @@ class MedicalInsightSchema(BaseModel):
 def fetch_wikipedia_summary(condition_name: str) -> str:
     """Fetches text summary from Wikipedia REST API for any skin condition."""
     try:
-        formatted_query = condition_name.strip().replace(" ", "_")
+        # Strip trailing slashes, parentheses, and extra spaces for clean Wiki queries
+        clean_name = condition_name.split("/")[0].split("(")[0].strip()
+        formatted_query = clean_name.replace(" ", "_")
         url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{formatted_query}"
 
         headers = {"User-Agent": "PocketDocAI/1.0 (contact@pocketdoc.ai)"}
@@ -40,12 +52,10 @@ def fetch_wikipedia_summary(condition_name: str) -> str:
 def fetch_dynamic_disease_info(condition_name: str) -> dict:
     """
     Dynamically fetches clinical context for ANY predicted disease 
-    and uses Gemini to parse it into structured JSON with built-in retry logic.
+    and uses Gemini to parse it into structured JSON with built-in model fallbacks.
     """
-    # 1. Fetch live summary from Wikipedia
     wiki_summary = fetch_wikipedia_summary(condition_name)
 
-    # 2. Instruct LLM to analyze and structure the medical context
     system_prompt = f"""
     You are PocketDoc AI, a medical information parser.
     Your job is to structure detailed medical guidance for the condition: '{condition_name}'.
@@ -63,12 +73,17 @@ def fetch_dynamic_disease_info(condition_name: str) -> dict:
     - 'doctor_consultation_advice': Clear advice on when to schedule an in-app doctor consultation.
     """
 
-    # Retry loop to handle temporary 503 capacity errors
-    max_retries = 3
-    for attempt in range(max_retries):
+    candidate_models = [
+        "gemini-3.7-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.5-flash",
+    ]
+
+    for model_name in candidate_models:
         try:
+            print(f"Attempting medical info generation using model: {model_name}...")
             response = gemini_client.models.generate_content(
-                model="gemini-2.5-flash",  # Switched to gemini-2.5-flash for stable availability
+                model=model_name,
                 contents=f"Provide structured insights for {condition_name}.",
                 config=types.GenerateContentConfig(
                     system_instruction=system_prompt,
@@ -78,18 +93,15 @@ def fetch_dynamic_disease_info(condition_name: str) -> dict:
                 ),
             )
 
-            # Parse output into Pydantic schema and convert to dict
+            # Parse and return as dictionary
             structured_data = MedicalInsightSchema.model_validate_json(response.text)
             return structured_data.model_dump()
 
         except Exception as e:
-            print(f"Attempt {attempt + 1} failed for {condition_name}: {e}")
-            if attempt < max_retries - 1:
-                time.sleep(1)  # Wait 1 second before retrying
-            else:
-                print(f"All retries failed for {condition_name}. Returning fallback response.")
+            print(f"Model {model_name} failed for {condition_name}: {e}. Retrying with next model...")
+            time.sleep(0.5)
 
-    # Safe Fallback
+    # Safe Fallback if all API attempts fail
     return {
         "meaning": f"{condition_name} is a dermatological condition identified by the AI visual scan.",
         "causes": ["Clinical evaluation required for precise cause determination."],
